@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+
+# Lambda package
+lambda_package/
+*.zip
+
+# Temp files
+*.jsonl
+*.parquet
+*.csv
+
+# AWS credentials
+.aws/
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
