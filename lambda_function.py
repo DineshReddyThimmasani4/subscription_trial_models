@@ -27,7 +27,7 @@ BUCKET = os.environ.get("BUCKET", "nearme-feed-store")
 PREFIX = os.environ.get("PREFIX", "dynamic")
 POST_WINDOW_DAYS = int(os.environ.get("POST_WINDOW_DAYS", "7"))
 ATHENA_DATABASE = os.environ.get("ATHENA_DATABASE", "closeapp")
-ATHENA_OUTPUT = os.environ.get("ATHENA_OUTPUT", f"s3://{BUCKET}/athena-results/")
+ATHENA_OUTPUT = os.environ.get("ATHENA_OUTPUT", f"s3://{BUCKET}/athena-results")
 CLASSIFICATION_BUCKET = os.environ.get("CLASSIFICATION_BUCKET", "closeapp-athena")
 CLASSIFICATION_PREFIX = "post_classification/event_name=post_classification_data_dump"
 
@@ -99,7 +99,11 @@ def load_previous_snapshot(date_str, prev_run_slot):
 
 
 def read_classification_dumps(since_date, now_date):
-    """Read post classification dumps from S3."""
+    """
+    Read post classification dumps from S3.
+
+    Files are in appevents format with JSON in the 'data' column.
+    """
     posts = {}
     date = datetime.strptime(since_date, "%Y-%m-%d")
     end = datetime.strptime(now_date, "%Y-%m-%d")
@@ -124,27 +128,43 @@ def read_classification_dumps(since_date, now_date):
                 table = pq.read_table(local_path)
                 df = table.to_pandas()
 
+                # Parse each event row (appevents format)
                 for _, row in df.iterrows():
-                    post_id = row.get("id")
+                    # Skip if not classification event
+                    if row.get("event_name") != "post_classification_data_dump":
+                        continue
+
+                    # Parse JSON from data column
+                    data_json = row.get("data")
+                    if not data_json:
+                        continue
+
+                    try:
+                        post_data = json.loads(data_json)
+                    except:
+                        continue
+
+                    # Extract post ID
+                    post_id = post_data.get("id") or post_data.get("postId")
                     if not post_id:
                         continue
 
                     posts[post_id] = {
                         "id": post_id,
-                        "c": row.get("created"),
-                        "topic": row.get("topic"),
-                        "subTopic": row.get("sub_topic"),
-                        "districtImportanceLevel": row.get("district_score"),
-                        "stateImportanceLevel": row.get("state_score"),
-                        "nationalImportanceLevel": row.get("national_score"),
-                        "isLocal": row.get("is_local", False),
-                        "isReporter": row.get("is_reporter", False),
-                        "containsVisualMedia": row.get("media_duration") is not None and row.get("media_duration") > 0,
-                        "duration": row.get("media_duration"),
-                        "titleLength": len(row.get("title", "")) if row.get("title") else 0,
-                        "contentLang": row.get("lang"),
-                        "creatorID": row.get("creator_pid"),
-                        "location": {"pid": row.get("district_pid") or row.get("location_pid")},
+                        "c": post_data.get("created") or post_data.get("createdAt"),
+                        "topic": post_data.get("topic"),
+                        "subTopic": post_data.get("subTopic") or post_data.get("sub_topic"),
+                        "districtImportanceLevel": post_data.get("districtImportanceLevel") or post_data.get("district_score"),
+                        "stateImportanceLevel": post_data.get("stateImportanceLevel") or post_data.get("state_score"),
+                        "nationalImportanceLevel": post_data.get("nationalImportanceLevel") or post_data.get("national_score"),
+                        "isLocal": post_data.get("isLocal") or post_data.get("is_local", False),
+                        "isReporter": post_data.get("isReporter") or post_data.get("is_reporter", False),
+                        "containsVisualMedia": post_data.get("containsVisualMedia") or (post_data.get("media_duration") or post_data.get("duration")) is not None,
+                        "duration": post_data.get("duration") or post_data.get("media_duration"),
+                        "titleLength": post_data.get("titleLength") or len(post_data.get("title", "")),
+                        "contentLang": post_data.get("contentLang") or post_data.get("lang"),
+                        "creatorID": post_data.get("creatorID") or post_data.get("creator_pid") or post_data.get("creatorId"),
+                        "location": {"pid": post_data.get("location", {}).get("pid") or post_data.get("district_pid") or post_data.get("location_pid")},
                     }
 
                 os.remove(local_path)
@@ -169,12 +189,12 @@ def query_engagement_and_conversions_athena(post_ids, since_date, since_ts=None)
     if not post_ids:
         return {}
 
-    # Chunk to avoid query size limits
-    if len(post_ids) > 5000:
+    # Chunk to avoid query size limits (Athena max 262KB)
+    if len(post_ids) > 1000:
         results = {}
-        for i in range(0, len(post_ids), 5000):
+        for i in range(0, len(post_ids), 1000):
             results.update(query_engagement_and_conversions_athena(
-                post_ids[i:i+5000], since_date, since_ts
+                post_ids[i:i+1000], since_date, since_ts
             ))
         return results
 
@@ -186,7 +206,7 @@ def query_engagement_and_conversions_athena(post_ids, since_date, since_ts=None)
         SELECT DISTINCT user_id
         FROM {ATHENA_DATABASE}.appevents
         WHERE event_name = 'feed_first_call'
-          AND userAge = 0
+          AND JSON_EXTRACT_SCALAR(data, '$.userAge') = '0'
           AND date >= '{since_date}'
     ),
 
@@ -302,11 +322,11 @@ def query_engagement_and_conversions_athena(post_ids, since_date, since_ts=None)
     FULL OUTER JOIN conversions c ON e.post_id = c.post_id
     """
 
-    # Execute Athena query
+    # Execute Athena query (use workgroup instead of direct output location)
     response = athena.start_query_execution(
         QueryString=query,
         QueryExecutionContext={"Database": ATHENA_DATABASE},
-        ResultConfiguration={"OutputLocation": ATHENA_OUTPUT}
+        WorkGroup="feed-ranking"
     )
     query_id = response["QueryExecutionId"]
 
@@ -375,8 +395,14 @@ def lambda_handler(event, context):
         prev_snapshot = load_previous_snapshot(date_str, prev_run_slot)
 
     # Read classification dumps
-    print(f"Reading classification dumps from {event_since_date} to {date_str}...")
-    post_meta = read_classification_dumps(event_since_date, date_str)
+    if is_cold_start:
+        # Cold start: read entire window (7 days)
+        print(f"Reading classification dumps from {event_since_date} to {date_str}...")
+        post_meta = read_classification_dumps(event_since_date, date_str)
+    else:
+        # Incremental: only read today's dumps (new posts only)
+        print(f"Reading classification dumps from {date_str} (today only)...")
+        post_meta = read_classification_dumps(date_str, date_str)
 
     # Merge with previous snapshot
     if not is_cold_start:
