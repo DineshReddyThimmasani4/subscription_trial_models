@@ -1,0 +1,9 @@
+# Lambda dependencies (deploy with AWS Lambda Layer)
+pyarrow>=21.0.0
+boto3>=1.42.0
+
+# EMR Serverless dependencies (built-in)
+pyspark>=3.5.0
+
+# Local development/testing
+pandas>=2.0.0
